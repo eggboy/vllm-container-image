@@ -1,0 +1,48 @@
+# =============================================================================
+# containerapp-probe.yaml — Startup probe config for Qwen3.6-35B-A3B on ACA GPU
+#
+# Why custom probes?
+#   Azure Container Apps does NOT add default probes for GPU workload profiles.
+#   Without an explicit startup probe, the platform may kill the container before
+#   the model finishes loading (~5-10 min for 35B MoE with FP8 quantization).
+#
+# Startup budget calculation:
+#   initialDelaySeconds (60) + failureThreshold (60) × periodSeconds (10) = 660s
+#   This gives the container up to ~11 minutes to start serving /health.
+#
+# vLLM /health endpoint returns 200 only after the model is fully loaded and
+# ready to serve requests.
+# =============================================================================
+properties:
+  template:
+    containers:
+      - name: qwen36-35b-a3b
+        image: crjay.azurecr.io/qwen36-35b-a3b-vllm:latest
+        resources:
+          cpu: 24
+          memory: 220Gi
+        probes:
+          - type: Startup
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 60
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          - type: Readiness
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3

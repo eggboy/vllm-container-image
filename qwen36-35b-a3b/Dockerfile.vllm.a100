@@ -1,0 +1,125 @@
+# =============================================================================
+# Dockerfile.vllm.qwen36-35b-a3b.a100 — Serve Qwen3.6-35B-A3B via vLLM on A100
+# Target: NVIDIA A100 80GB GPU
+#
+# Qwen3.6-35B-A3B: Mixture-of-Experts model, 35B total params, 3B active per
+# token. Uses pre-quantized GPTQ-Int4 checkpoint (~18 GB). Fits 1x A100 80GB
+# with ample headroom for 128K KV-cache. Apache 2.0 license.
+#
+# Why GPTQ-Int4 (not FP8)?
+#   A100 lacks native FP8 tensor cores → vLLM falls back to Marlin kernels.
+#   Marlin requires matrix dimensions divisible by 64, but MoE expert layers
+#   in this model have size_n=4304 (not divisible by 64). FP8 crashes.
+#   GPTQ-Int4 uses Marlin WNA16 MoE backend (different alignment requirement)
+#   and offers excellent compression with <2% coding accuracy loss.
+#
+# Important: Mamba hybrid architecture constraint
+#   This model uses hybrid Mamba layers with block_size=2096. When using
+#   --enable-chunked-prefill, you MUST set --max-num-batched-tokens >= 2096
+#   (default is 2048 which causes AssertionError at startup).
+#
+# Pre-quantized model: palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4
+#   - Only MoE expert weights quantized to INT4
+#   - Attention and embedding layers remain in BF16 for quality
+#   - Based on official Qwen quantization config
+#
+# MoE characteristics:
+#   - Only 3B params active per forward pass → fast inference per token
+#   - Full 35B weights must reside in GPU memory
+#   - KV-cache sized by attention layers (shared), not expert FFNs
+#   - GPTQ-Int4 reduces weights ~4x, unlocking long context
+#
+# A100 80GB:
+#   - 80 GB HBM2e, 2 TB/s bandwidth
+#   - GPTQ INT4 weight quantization (pre-quantized checkpoint)
+#   - FP8 KV-cache via software quantization — halves cache memory
+#   - torch.compile + CUDA graphs enabled (GDN backend supports UNIFORM_BATCH)
+#
+# Memory budget (approximate):
+#   - Model weights (GPTQ INT4): ~21 GB
+#   - CUDA graph pool: ~0.5 GB
+#   - Available at 0.95 util: 76 GB
+#   - KV-cache headroom: ~54 GB (FP8) — fits 128K context with 8 seqs
+#   - Per-sequence at 128K (FP8): ~1.3 GB (attention KV + GDN state)
+#
+# Build via ACR Tasks:
+#   az acr build --registry <ACR_NAME> \
+#       --image qwen36-35b-a3b-vllm:latest \
+#       --file Dockerfile.vllm.a100 \
+#       --timeout 7200 .
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Download pre-quantized GPTQ-Int4 model weights (~18 GB)
+# ---------------------------------------------------------------------------
+FROM python:3.12.11-slim AS model-download
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN uv pip install --system "huggingface_hub"
+
+RUN hf download palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4 \
+        --local-dir /model/qwen36-35b-a3b
+
+# ---------------------------------------------------------------------------
+# Stage 2: vLLM runtime (A100-optimized)
+# ---------------------------------------------------------------------------
+FROM vllm/vllm-openai:latest
+
+LABEL org.opencontainers.image.title="Qwen3.6-35B-A3B vLLM Server (A100)" \
+      org.opencontainers.image.description="Qwen3.6-35B-A3B MoE (35B total, 3B active) served via vLLM on A100 80GB"
+
+ENV MODEL_PATH=/model/qwen36-35b-a3b
+
+COPY --from=model-download /model/qwen36-35b-a3b /model/qwen36-35b-a3b
+
+EXPOSE 8000
+
+# Health check for startup probes and readiness
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+
+# ---- vLLM serving flags (A100 + MoE + GPTQ-Int4, optimized) ----
+# --quantization gptq_marlin     : GPTQ-Int4 via Marlin WNA16 kernel (~21 GB on GPU)
+# --gpu-memory-utilization 0.95 : Maximize 80 GB HBM2e (76 GB usable)
+# --max-model-len 131072        : 128K context for coding agent workloads
+# --dtype float16               : GPTQ requires float16 (not bfloat16)
+# --kv-cache-dtype fp8          : FP8 KV-cache = 2x capacity vs FP16 (~55 GB budget)
+# --enable-prefix-caching       : Reuse KV-cache for shared system prompts/file context
+# --mamba-cache-mode align      : Cache GDN (linear attention) state at block boundaries
+#                                  enabling prefix reuse for Mamba layers too
+# --enable-chunked-prefill      : Break long prefills into chunks for stable latency
+# --max-num-batched-tokens 8384 : 4× Mamba block_size (2096). Must be >= 2096.
+#                                  Higher = faster TTFT for long contexts.
+#                                  8384 gives ~2× faster TTFT vs minimum 4192.
+# --reasoning-parser qwen3      : Enable Qwen3.6 native thinking/reasoning mode
+# --tool-call-parser qwen3_coder: Qwen3.6 native tool calling format
+# --max-num-seqs 8              : Handles parallel tool calls from coding agents
+# --served-model-name           : Explicit model name for API compatibility
+#
+# NOTE: No --enforce-eager. torch.compile + CUDA graphs are enabled (default).
+# CUDA graphs give 10-30% decode speedup. The GDN attention backend supports
+# UNIFORM_BATCH capture mode. If you hit instability, add --enforce-eager back.
+CMD [ \
+    "/model/qwen36-35b-a3b", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--tensor-parallel-size", "1", \
+    "--trust-remote-code", \
+    "--quantization", "gptq_marlin", \
+    "--gpu-memory-utilization", "0.95", \
+    "--max-model-len", "131072", \
+    "--dtype", "float16", \
+    "--kv-cache-dtype", "fp8", \
+    "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "8384", \
+    "--enable-auto-tool-choice", \
+    "--reasoning-parser", "qwen3", \
+    "--tool-call-parser", "qwen3_coder", \
+    "--max-num-seqs", "8", \
+    "--served-model-name", "Qwen3.6-35B-A3B" \
+]
