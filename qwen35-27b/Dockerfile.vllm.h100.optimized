@@ -1,0 +1,86 @@
+# =============================================================================
+# Dockerfile.vllm.h100.optimized — Serve Qwen3.5-27B (27B dense) via vLLM on H100
+# Target: AKS with NVIDIA H100 80GB GPU
+#
+# Qwen3.5-27B: 27B dense params, ~54 GB BF16 weights, fits 1x H100 80GB
+# with ample headroom for 128K KV-cache. Apache 2.0 license.
+# Native 256K context; we cap at 131072 (128K) for Copilot BYOK compatibility.
+#
+# H100 advantages:
+#   - Native FP8 via Transformer Engine — FP8 KV-cache halves cache memory
+#   - 3.35 TB/s HBM3 bandwidth — fast KV-cache ops
+#   - CUDA graph support — no need for --enforce-eager
+#
+# Build via ACR Tasks:
+#   az acr build --registry crjay --image qwen35-coder-27b-vllm:optimized \
+#       --file Dockerfile.vllm.h100.optimized --timeout 7200 .
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Download model weights (~54 GB)
+# ---------------------------------------------------------------------------
+FROM python:3.12.11-slim AS model-download
+
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+
+# Add swap space for large model downloads
+RUN dmesg 2>/dev/null || true && \
+    dd if=/dev/zero of=/swapfile bs=1M count=8192 && \
+    chmod 600 /swapfile && \
+    swapon /swapfile
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN uv pip install --system "huggingface_hub"
+
+RUN hf download Qwen/Qwen3.5-27B \
+        --local-dir /model/qwen35-27b
+
+# ---------------------------------------------------------------------------
+# Stage 2: vLLM runtime (H100-optimized)
+# ---------------------------------------------------------------------------
+FROM vllm/vllm-openai:v0.6.3
+
+LABEL org.opencontainers.image.title="Qwen3.5-27B vLLM Server (H100 Optimized)" \
+      org.opencontainers.image.description="Qwen3.5-27B 27B dense served via vLLM on H100 for Copilot BYOK with optimizations"
+
+ENV MODEL_PATH=/model/qwen35-27b
+
+COPY --from=model-download /model/qwen35-27b /model/qwen35-27b
+
+EXPOSE 8000
+
+# Health check to verify vLLM server readiness
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+
+# --gpu-memory-utilization 0.95 : Maximize 80 GB HBM3
+# --max-model-len 131072        : 128K context for Copilot BYOK (system prompt
+#                                  alone can exceed 32K). Model natively supports
+#                                  up to 256K.
+# --kv-cache-dtype fp8           : FP8 KV-cache halves memory vs BF16, critical
+#                                  for fitting 128K context. H100 has native FP8.
+# --enable-prefix-caching       : Reuse KV-cache for shared prefixes
+# --max-num-seqs 8              : Limit concurrent requests to prevent memory
+#                                  pressure with 128K context windows
+# --served-model-name           : Explicit model name for multi-model deployments
+# --dtype auto                   : vLLM auto-selects bfloat16
+CMD [ \
+    "/model/qwen35-27b", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--tensor-parallel-size", "1", \
+    "--trust-remote-code", \
+    "--gpu-memory-utilization", "0.95", \
+    "--max-model-len", "131072", \
+    "--dtype", "auto", \
+    "--kv-cache-dtype", "fp8", \
+    "--enable-prefix-caching", \
+    "--enable-auto-tool-choice", \
+    "--tool-call-parser", "qwen3_coder", \
+    "--max-num-seqs", "8", \
+    "--served-model-name", "Qwen3.5-27B" \
+]
