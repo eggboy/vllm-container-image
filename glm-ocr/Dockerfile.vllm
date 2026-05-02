@@ -1,0 +1,47 @@
+###############################################################################
+# Stage 1 – Download model weights
+###############################################################################
+FROM python:3.12.11-slim AS model-fetch
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /tmp/build
+
+RUN uv init --no-readme --no-pin-python && \
+    uv add "huggingface_hub[cli]"
+
+RUN uv run hf download zai-org/GLM-OCR \
+        --local-dir /model/GLM-OCR
+
+###############################################################################
+# Stage 2 – vLLM runtime
+###############################################################################
+FROM vllm/vllm-openai:latest
+
+LABEL org.opencontainers.image.source="https://github.com/eggboy/vllm-container-image" \
+      org.opencontainers.image.description="GLM-OCR served via vLLM"
+
+ENV MODEL_PATH=/model/GLM-OCR
+
+# GLM-OCR requires transformers >= 5.x (model_type: glm_ocr)
+RUN pip install --no-cache-dir "transformers>=5.0.0"
+
+COPY --from=model-fetch /model/GLM-OCR /model/GLM-OCR
+
+EXPOSE 8000
+
+# --tensor-parallel-size: increase for multi-GPU setups
+# --max-model-len:        adjust based on available GPU memory
+# --trust-remote-code:    required by some HF models
+ENTRYPOINT ["vllm", "serve"]
+CMD [ \
+    "/model/GLM-OCR", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--tensor-parallel-size", "1", \
+    "--trust-remote-code", \
+    "--limit-mm-per-prompt", "{\"image\": 2}" \
+]
