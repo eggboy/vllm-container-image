@@ -1,42 +1,83 @@
 # =============================================================================
-# Dockerfile.vllm.qwen36-27b.aca — Serve Qwen3.6-27B via vLLM on A100
+# Dockerfile.vllm.qwen36-27b.aca — Serve Qwen3.6-27B-FP8 via vLLM on A100
 # Target: Azure Container Apps Serverless GPU (NVIDIA A100 80GB)
 #
-# Qwen3.6-27B: 27B dense params, ~55 GB BF16 weights, fits 1x A100 80GB
-# with ample headroom for 128K KV-cache. Apache 2.0 license.
+# Qwen3.6-27B: 27B dense params, hybrid Gated DeltaNet (GDN) + Gated Attention.
+# Uses official Qwen FP8 checkpoint (~28 GB) instead of BF16 (~55 GB), freeing
+# ~27 GB additional GPU memory for KV-cache. Apache 2.0 license.
 # Native 262K context; we cap at 131072 (128K) for Copilot BYOK compatibility.
+#
+# Why FP8 weights (Qwen/Qwen3.6-27B-FP8)?
+#   BF16 weights (~55 GB) leave only ~21 GB for KV-cache at 0.95 utilization,
+#   barely fitting 5 full 128K sequences. The official FP8 checkpoint (fine-
+#   grained FP8 E4M3, block size 128) reduces weights to ~28 GB, freeing ~48 GB
+#   for KV-cache. On A100 (SM80, no native FP8 tensor cores), vLLM uses Marlin
+#   W8A16 kernels — weights are dequantized during GEMM. The primary benefit is
+#   memory capacity and bandwidth savings (~2× less data to move), not FP8
+#   compute acceleration (which requires H100/SM89+).
+#   Quality: Qwen reports "nearly identical" performance to BF16.
+#
+# Architecture: 27B dense, 64 layers
+#   Layout: 16 × (3 × (Gated DeltaNet → FFN) → 1 × (Gated Attention → FFN))
+#   - 48 GDN layers: linear attention with O(1) recurrent state (no KV-cache)
+#   - 16 full attention layers: 24Q/4KV heads, head_dim 256 (traditional KV-cache)
+#   - Only 16/64 layers need KV-cache that grows with sequence length
+#   - FFN intermediate dim: 17408, MTP: trained with multi-steps
+#   - Mamba hybrid block_size=2096 — constrains chunked prefill alignment
 #
 # A100 80GB (Consumption-GPU-NC24-A100):
 #   - 80 GB HBM2e, 2 TB/s bandwidth
 #   - FP8 KV-cache via software quantization — halves cache memory
 #   - 24 vCPUs, 220 GiB system memory on ACA NC24-A100 profile
-#   - CUDA graphs work well with dense models (no --enforce-eager needed)
+#   - torch.compile + CUDA graphs (O2 default: FULL_AND_PIECEWISE mode)
+#   - Mamba hybrid: --mamba-cache-mode align + chunked-prefill for stable latency
+#
+# Memory budget (FP8 weights, approximate):
+#   - Model weights (FP8 Marlin W8A16): ~28 GB
+#   - CUDA graphs + activations: ~1 GB
+#   - Available at 0.95 util: 76 GB
+#   - KV-cache headroom: ~47 GB
+#   - KV-cache per token (FP8): ~32 KB (16 attn layers × 4 KV heads × 256 dim)
+#   - Per sequence at 128K (FP8 KV): ~4 GB
+#   - Comfortable for ~12 concurrent full-context sequences
+#   - GDN recurrent state: fixed-size per layer (~150 MB/seq, does NOT grow
+#     with context length — key advantage of the hybrid architecture)
+#
+# Known issues (as of May 2026):
+#   - MTP speculative decoding has open compatibility issues with hybrid models
+#     (vLLM PR #39949). Do NOT enable until merged.
+#   - mamba-cache-mode "all" (14× prefill speedup) is WIP (PR #36649, not merged).
+#     Stick with "align" for production stability.
+#   - GPTQ/AWQ quantization has KV cache page size bug with hybrid models
+#     (vLLM #41153). FP8 uses a different code path and is unaffected.
 #
 # Qwen3.6 improvements over 3.5:
 #   - Hybrid Gated DeltaNet architecture for better long-context
 #   - Native reasoning/thinking mode (--reasoning-parser qwen3)
 #   - Stronger agentic coding and tool-use benchmarks
-#   - Multimodal support (text + image)
+#   - Multimodal support (text + image + video)
+#   - Thinking preservation for multi-turn agent scenarios
 #
 # Build via ACR Tasks:
 #   az acr build --registry <ACR_NAME> \
 #       --image qwen36-27b-vllm:latest \
-#       --file Dockerfile.vllm.qwen36-27b.aca \
+#       --file Dockerfile.vllm.a100 \
 #       --timeout 7200 .
 #
-# Build with Hugging Face token (for gated/private models):
+# Build with Hugging Face token (optional, avoids rate limits):
 #   az acr build --registry <ACR_NAME> \
 #       --image qwen36-27b-vllm:latest \
-#       --file Dockerfile.vllm.qwen36-27b.aca \
+#       --file Dockerfile.vllm.a100 \
 #       --build-arg HF_TOKEN=hf_xxx \
 #       --timeout 7200 .
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# Stage 1: Download model weights (~55 GB BF16)
+# Stage 1: Download official FP8 model weights (~28 GB)
 # ---------------------------------------------------------------------------
 FROM python:3.12.11-slim AS model-download
 
+# Optional: HF token avoids download rate limits in CI/CD pipelines
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
 
@@ -44,16 +85,16 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 RUN uv pip install --system "huggingface_hub"
 
-RUN hf download Qwen/Qwen3.6-27B \
+RUN hf download Qwen/Qwen3.6-27B-FP8 \
         --local-dir /model/qwen36-27b
 
 # ---------------------------------------------------------------------------
 # Stage 2: vLLM runtime (A100-optimized for ACA Serverless GPU)
 # ---------------------------------------------------------------------------
-FROM vllm/vllm-openai:latest
+FROM vllm/vllm-openai:v0.20.1
 
-LABEL org.opencontainers.image.title="Qwen3.6-27B vLLM Server (A100 ACA)" \
-      org.opencontainers.image.description="Qwen3.6-27B 27B dense served via vLLM on A100 for Azure Container Apps Serverless GPU"
+LABEL org.opencontainers.image.title="Qwen3.6-27B-FP8 vLLM Server (A100 ACA)" \
+      org.opencontainers.image.description="Qwen3.6-27B-FP8 27B dense (FP8 Marlin) served via vLLM on A100 80GB"
 
 ENV MODEL_PATH=/model/qwen36-27b
 
@@ -67,21 +108,42 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
 
 ENTRYPOINT ["vllm", "serve"]
 
-# ---- vLLM serving flags (A100 + ACA optimized) ----
-# --gpu-memory-utilization 0.95 : Maximize 80 GB HBM2e
-# --max-model-len 131072        : 128K context for Copilot BYOK (system prompt
-#                                  alone can exceed 32K). Model natively supports
-#                                  up to 262K.
-# --kv-cache-dtype fp8           : FP8 KV-cache halves memory vs BF16, critical
-#                                  for fitting 128K context. Software FP8 on A100.
-# --enable-prefix-caching       : Reuse KV-cache for shared prefixes — reduces
-#                                  redundant compute for repeated system prompts
+# ---- vLLM serving flags (A100 + FP8 + hybrid GDN, optimized) ----
+# --gpu-memory-utilization 0.95 : Maximize 80 GB HBM2e (76 GB usable)
+# --max-model-len 131072        : 128K context for Copilot BYOK. Model natively
+#                                  supports 262K, but 128K balances concurrency.
+# --dtype auto                   : vLLM auto-detects FP8 quantization config
+# --kv-cache-dtype fp8           : FP8 KV-cache = 2× capacity vs BF16 (~47 GB budget)
+#                                  Software FP8 on A100 (stored as uint8, dequant
+#                                  before attention). ~32 KB/token for 16 attn layers.
+# --enable-prefix-caching       : Reuse KV-cache for shared system prompts/file context
+# --mamba-cache-mode align      : Cache GDN (linear attention) state at block boundaries
+#                                  enabling prefix reuse for Mamba layers. "all" mode
+#                                  (14× faster prefill) is WIP — use "align" for now.
+# --enable-chunked-prefill      : Break long prefills into chunks for stable latency
+# --max-num-batched-tokens 8384 : 4× Mamba block_size (2096). Must be >= 2096.
+#                                  Higher = faster TTFT for long contexts.
+#                                  8384 gives ~2× faster TTFT vs minimum 4192.
+# --performance-mode interactivity : Favor low per-request latency over aggregate
+#                                  throughput — ideal for coding agent workloads.
 # --reasoning-parser qwen3      : Enable Qwen3.6 native thinking/reasoning mode
 # --tool-call-parser qwen3_coder: Qwen3.6 native tool calling format
-# --max-num-seqs 8              : Limit concurrent requests to prevent memory
-#                                  pressure with 128K context windows
+# --max-num-seqs 12             : FP8 weights free ~47 GB for KV-cache, comfortably
+#                                  fitting 12 full 128K seqs (~4 GB each). Up from 8
+#                                  with BF16 weights. Don't go above 12 without
+#                                  profiling — fragmentation + GDN state add up.
 # --served-model-name           : Explicit model name for API compatibility
-# --dtype auto                   : vLLM auto-selects bfloat16
+#
+# NOTE: No --quantization flag needed — vLLM auto-detects FP8 from config.json.
+# NOTE: No --enforce-eager. torch.compile + CUDA graphs are enabled by default (O2).
+#       The GDN attention backend supports UNIFORM_BATCH capture mode.
+#
+# OPTIONAL: For text-only coding agents, add --language-model-only to skip the
+#           vision encoder and reclaim ~1 GB for KV-cache.
+# OPTIONAL: MTP speculative decoding (--speculative-config below) is supported
+#           architecturally but has open bugs with hybrid models (PR #39949).
+#           Uncomment ONLY after the PR is merged:
+#   "--speculative-config", "{\"method\":\"qwen3_next_mtp\",\"num_speculative_tokens\":2}",
 CMD [ \
     "/model/qwen36-27b", \
     "--host", "0.0.0.0", \
@@ -93,9 +155,13 @@ CMD [ \
     "--dtype", "auto", \
     "--kv-cache-dtype", "fp8", \
     "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "8384", \
+    "--performance-mode", "interactivity", \
     "--enable-auto-tool-choice", \
     "--reasoning-parser", "qwen3", \
     "--tool-call-parser", "qwen3_coder", \
-    "--max-num-seqs", "8", \
+    "--max-num-seqs", "12", \
     "--served-model-name", "Qwen3.6-27B" \
 ]
