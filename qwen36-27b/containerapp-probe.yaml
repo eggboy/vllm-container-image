@@ -1,0 +1,59 @@
+# =============================================================================
+# containerapp-probe.yaml — Startup probe config for Qwen3.6-27B-FP8 on ACA GPU
+#
+# Why custom probes?
+#   Azure Container Apps does NOT add default probes for GPU workload profiles.
+#   Without an explicit startup probe, the platform may kill the container before
+#   the model finishes loading, causing a premature ("immature") startup timeout.
+#
+# What makes 27B-FP8 slow to start?
+#   1. Image pull: model weights (~28 GB FP8) are baked into the image.
+#   2. Weight load into GPU HBM + FP8 Marlin kernel prep.
+#   3. torch.compile + CUDA graph capture for the hybrid Gated DeltaNet backend
+#      (first-run compilation is the long pole — can take several minutes).
+#   vLLM /health returns 200 ONLY after the model is fully loaded and ready.
+#
+# Startup budget calculation:
+#   initialDelaySeconds (60) + failureThreshold (60) × periodSeconds (20) = 1260s
+#   This gives the container up to ~21 minutes to start serving /health,
+#   comfortably covering image decompression + FP8 load + torch.compile.
+#   NOTE: ACA constrains initialDelaySeconds to the range [0, 60]. To extend the
+#   startup window further, increase periodSeconds (max 240) or failureThreshold,
+#   NOT initialDelaySeconds.
+#
+# Liveness/Readiness probes only begin AFTER the Startup probe first succeeds,
+# so their short initialDelaySeconds will not kill the container during boot.
+# =============================================================================
+properties:
+  template:
+    containers:
+      - name: qwen36-27b
+        image: crjay.azurecr.io/qwen36-27b-vllm:latest
+        resources:
+          cpu: 24
+          memory: 220Gi
+        probes:
+          - type: Startup
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 15
+            failureThreshold: 60
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          - type: Readiness
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
