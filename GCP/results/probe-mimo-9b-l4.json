@@ -1,0 +1,42 @@
+{
+  "base_url": "https://mimo-v2-6-distill-qwen-9b-590618446755.asia-southeast1.run.app",
+  "model": "MiMo-V2.6-Distill-Qwen-9B",
+  "models": [
+    "MiMo-V2.6-Distill-Qwen-9B"
+  ],
+  "tool_call": {
+    "seconds": 2.26,
+    "tool_calls": [
+      {
+        "name": "read_file",
+        "arguments": "{}"
+      }
+    ],
+    "reasoning_present": true,
+    "finish_reason": "tool_calls",
+    "usage": {
+      "prompt_tokens": 109,
+      "total_tokens": 142,
+      "completion_tokens": 33,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": {
+        "reasoning_tokens": 14
+      }
+    }
+  },
+  "single_stream": {
+    "ttft_s": 0.336,
+    "total_s": 24.43,
+    "completion_tokens": 384,
+    "decode_tok_s": 15.9,
+    "finish_reason": "stop"
+  },
+  "concurrent": {
+    "streams": 4,
+    "wall_s": 27.43,
+    "aggregate_tok_s": 58.3,
+    "ttft_s_median": 0.242,
+    "per_stream_decode_tok_s_median": 14.7,
+    "completion_tokens_total": 1600
+  }
+}

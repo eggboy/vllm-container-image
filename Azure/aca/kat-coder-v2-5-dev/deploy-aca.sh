@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy-aca.sh — Deploy Qwen3.6-27B-FP8 on Azure Container Apps Serverless GPU
+# deploy-aca.sh — Deploy KAT-Coder-V2.5-Dev on Azure Container Apps Serverless GPU
 #
-# NOTE ON GPU CHOICE (H100 vs A100):
-#   Azure Container Apps Serverless GPU does NOT offer an H100 workload profile
-#   in any region — the only Consumption GPU profiles available are:
-#     - Consumption-GPU-NC8as-T4  (16 GB, too small for a 27B model)
-#     - Consumption-GPU-NC24-A100 (80 GB)
-#   Qwen3.6-27B-FP8 (~28 GB weights) therefore runs on A100, which is the
-#   target the Dockerfile is optimized for. If true H100 is required, it must
-#   be hosted on AKS (NC H100 v5) rather than ACA.
+# GPU CHOICE: ACA Serverless GPU offers only Consumption-GPU-NC8as-T4 (16 GB)
+#   and Consumption-GPU-NC24-A100 (80 GB) — no H100 profile in any region. The
+#   AWQ-INT4 build (~24 GB) runs on the A100 profile. See ../../README.md.
 #
 # Prerequisites:
 #   - Azure CLI logged in (az login)
 #   - GPU quota approved for Consumption-GPU-NC24-A100
-#   - Image already pushed to ACR: crjay.azurecr.io/qwen36-27b-vllm:latest
+#   - Image pushed to ACR: crjay.azurecr.io/kat-coder-v2-5-dev-vllm:latest
+#     Build it with ACR Tasks from the repo root Dockerfile:
+#       ../../build-acr.sh kat-coder-v2-5-dev/Dockerfile.vllm.a100
+#     (equivalent to: az acr build --registry crjay --image kat-coder-v2-5-dev-vllm:latest
+#      --file Dockerfile.vllm.a100 --timeout 7200 .   run inside ../../../kat-coder-v2-5-dev)
 #
 # Usage:
 #   chmod +x deploy-aca.sh && ./deploy-aca.sh
@@ -24,12 +23,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration — adjust these as needed
 # ---------------------------------------------------------------------------
-RESOURCE_GROUP="rg-qwen36-27b"
+RESOURCE_GROUP="rg-kat-coder-v2-5-dev"
 LOCATION="eastus"
-ENVIRONMENT_NAME="aca-env-qwen36-27b"
-CONTAINER_APP_NAME="qwen36-27b"
+ENVIRONMENT_NAME="aca-env-kat-coder-v2-5-dev"
+CONTAINER_APP_NAME="kat-coder-v2-5-dev"
 ACR_NAME="crjay"
-IMAGE="${ACR_NAME}.azurecr.io/qwen36-27b-vllm:latest"
+IMAGE="${ACR_NAME}.azurecr.io/kat-coder-v2-5-dev-vllm:latest"
 WORKLOAD_PROFILE_NAME="gpu-a100"
 WORKLOAD_PROFILE_TYPE="Consumption-GPU-NC24-A100"
 
@@ -53,10 +52,10 @@ az containerapp env workload-profile add \
     --workload-profile-name "$WORKLOAD_PROFILE_NAME" \
     --workload-profile-type "$WORKLOAD_PROFILE_TYPE"
 
-echo "=== Enabling Artifact Streaming on ACR (faster pull of the ~30GB image) ==="
+echo "=== Enabling Artifact Streaming on ACR ==="
 az acr artifact-streaming create \
     --registry "$ACR_NAME" \
-    --image "qwen36-27b-vllm:latest" 2>/dev/null || \
+    --image "kat-coder-v2-5-dev-vllm:latest" 2>/dev/null || \
     echo "  (Artifact streaming may already be enabled or not supported on this SKU)"
 
 echo "=== Creating Container App ==="
@@ -75,9 +74,8 @@ az containerapp create \
     --workload-profile-name "$WORKLOAD_PROFILE_NAME" \
     --output none
 
-echo "=== Applying Startup/Liveness/Readiness Probes (YAML) ==="
-# vLLM needs a generous startup budget (~21 min) to load FP8 weights and run
-# torch.compile for the hybrid GDN backend before /health returns 200.
+echo "=== Updating Container App with Startup Probe (YAML) ==="
+# Export current config, merge probe settings, and update
 az containerapp update \
     --name "$CONTAINER_APP_NAME" \
     --resource-group "$RESOURCE_GROUP" \
@@ -96,10 +94,10 @@ echo "Application URL: https://${FQDN}"
 echo "Health check:    https://${FQDN}/health"
 echo "OpenAI API:      https://${FQDN}/v1/chat/completions"
 echo ""
-echo "The container takes ~10-20 min to fully start (FP8 load + torch.compile)."
-echo "Verify readiness with:"
+echo "The container takes ~5-15 min to fully start (AWQ load + torch.compile)."
+echo "Test with:"
 echo "  curl https://${FQDN}/v1/models"
 echo ""
 echo "Use as Copilot CLI BYOK endpoint:"
 echo "  export COPILOT_LLM_BASE_URL=\"https://${FQDN}/v1\""
-echo "  export COPILOT_LLM_MODEL=\"Qwen3.6-27B\""
+echo "  export COPILOT_LLM_MODEL=\"KAT-Coder-V2.5-Dev\""

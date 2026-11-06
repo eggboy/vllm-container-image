@@ -1,0 +1,42 @@
+{
+  "base_url": "https://qwen38-27b-590618446755.asia-southeast1.run.app",
+  "model": "Qwen3.8-27B",
+  "models": [
+    "Qwen3.8-27B"
+  ],
+  "tool_call": {
+    "seconds": 1.48,
+    "tool_calls": [
+      {
+        "name": "read_file",
+        "arguments": "{\"path\": \"README.md\"}"
+      }
+    ],
+    "reasoning_present": true,
+    "finish_reason": "tool_calls",
+    "usage": {
+      "prompt_tokens": 331,
+      "total_tokens": 389,
+      "completion_tokens": 58,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": {
+        "reasoning_tokens": 30
+      }
+    }
+  },
+  "single_stream": {
+    "ttft_s": 0.129,
+    "total_s": 9.19,
+    "completion_tokens": 408,
+    "decode_tok_s": 45.0,
+    "finish_reason": "stop"
+  },
+  "concurrent": {
+    "streams": 16,
+    "wall_s": 15.61,
+    "aggregate_tok_s": 614.9,
+    "ttft_s_median": 0.182,
+    "per_stream_decode_tok_s_median": 38.9,
+    "completion_tokens_total": 9600
+  }
+}

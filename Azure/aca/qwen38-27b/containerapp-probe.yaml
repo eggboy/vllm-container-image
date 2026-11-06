@@ -1,5 +1,5 @@
 # =============================================================================
-# containerapp-probe.yaml — Startup probe config for Qwen3.6-27B-FP8 on ACA GPU
+# containerapp-probe.yaml — Startup probe config for Qwen3.8-27B-FP8 on ACA GPU
 #
 # Why custom probes?
 #   Azure Container Apps does NOT add default probes for GPU workload profiles.
@@ -7,7 +7,7 @@
 #   the model finishes loading, causing a premature ("immature") startup timeout.
 #
 # What makes 27B-FP8 slow to start?
-#   1. Image pull: model weights (~28 GB FP8) are baked into the image.
+#   1. Image pull: model weights (~31 GB FP8) are baked into the image.
 #   2. Weight load into GPU HBM + FP8 Marlin kernel prep.
 #   3. torch.compile + CUDA graph capture for the hybrid Gated DeltaNet backend
 #      (first-run compilation is the long pole — can take several minutes).
@@ -27,8 +27,8 @@
 properties:
   template:
     containers:
-      - name: qwen36-27b
-        image: crjay.azurecr.io/qwen36-27b-vllm:latest
+      - name: qwen38-27b
+        image: crjay.azurecr.io/qwen38-27b-vllm:latest
         resources:
           cpu: 24
           memory: 220Gi

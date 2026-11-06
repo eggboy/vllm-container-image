@@ -1,0 +1,94 @@
+# =============================================================================
+# Dockerfile.vllm.h100.mig — Serve Qwen3.5-4B via vLLM on one H100 MIG slice
+# (2g.24gb profile). A small, fast model for inline completion / low-latency
+# chat in shared-GPU deployments. Replaces Qwen2.5-Coder-1.5B-Instruct (2024).
+#
+# Qwen/Qwen3.5-4B (2026-02-27, Apache-2.0): 4B dense, hybrid Gated DeltaNet +
+# Gated Attention (same family as the 27B/9B images), 262K native context,
+# native thinking mode and Qwen3 XML tool calling. It is the newest small Qwen
+# with a vLLM-native architecture; no vendor publishes SWE-bench numbers for
+# <=4B models, so this image is chosen for latency, tool-calling fidelity and
+# family consistency rather than a benchmark score. (The Qwen3.8 series has no
+# model below 27B.)
+#
+# Weights: BF16 as shipped (~9.3 GB incl. vision tower; ~8.5 GB loaded with
+# --language-model-only). Tons of KV headroom in a 24 GB slice.
+# served-model-name "Qwen3.5-4B" is the model id clients send in requests.
+#
+# Memory (H100 94GB MIG profile 2g.24gb, ~24 GB ≈ 23.5 GiB visible):
+#   - Weights (BF16, vision tower skipped):             ~8 GiB
+#   - Activations (4192 batched tokens) + CUDA graphs:   ~1 GiB
+#   - Budget at 0.92 utilization:                        ~21.6 GiB
+#   - KV/GDN cache pool:                                 ~12 GiB
+#   - Per-token pool cost ≈ 32 layers × 2 MiB GDN-state page / 1048 tokens
+#     ≈ 64 KB → ~190K cached tokens → ~6 full 32K sequences resident.
+#
+# Thinking is DISABLED by default on this image (--default-chat-template-kwargs
+# {"enable_thinking": false}): an inline-completion endpoint should not spend
+# seconds on a <think> block. Clients can opt in per request with
+# chat_template_kwargs {"enable_thinking": true}; --reasoning-parser qwen3 is
+# still set so that path returns reasoning_content cleanly. Qwen's recommended
+# non-thinking sampling (temperature 0.7, top_p 0.8, top_k 20) is applied as
+# the server default because the checkpoint ships no generation_config.json.
+#
+# vLLM runtime: v0.32.0.
+#
+# Build (downloads ~9 GB of weights into the image):
+#   docker build -f Dockerfile.vllm.h100.mig -t qwen35-4b-vllm:mig2g .
+# Optional HF token (avoids download rate limits): --build-arg HF_TOKEN=hf_xxx
+# Run on a MIG device (find the UUID with `nvidia-smi -L`):
+#   docker run --gpus '"device=MIG-<uuid>"' --ipc=host -p 8000:8000 \
+#       -e VLLM_API_KEY=change-me qwen35-4b-vllm:mig2g
+# First start takes 2–8 min; /health returns 200 only when ready (see README.md).
+# =============================================================================
+
+FROM python:3.12.11-slim AS model-download
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv pip install --system "huggingface_hub"
+RUN hf download Qwen/Qwen3.5-4B \
+        --local-dir /model/qwen35-4b
+
+FROM vllm/vllm-openai:v0.32.0
+LABEL org.opencontainers.image.title="Qwen3.5-4B vLLM Server (H100 MIG 2g.24gb)" \
+      org.opencontainers.image.description="Qwen3.5-4B served via vLLM on one H100 2g.24gb MIG slice"
+
+ENV MODEL_PATH=/model/qwen35-4b
+COPY --from=model-download /model/qwen35-4b /model/qwen35-4b
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+# --language-model-only  : skip the vision encoder (weights + multimodal
+#                          profiling budget).
+# --kv-cache-dtype fp8   : native FP8 KV on H100, halves attention cache.
+# --mamba-cache-mode align + --enable-chunked-prefill + --max-num-batched-tokens
+#                          4192 (>= hybrid Mamba block size): required combo for
+#                          prefix caching on hybrid GDN models.
+# --tool-call-parser qwen3_coder: tool calling is required by coding agents
+#                          (e.g. Copilot BYOK).
+# Set VLLM_API_KEY in the container environment to require a bearer token.
+CMD [ \
+    "/model/qwen35-4b", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--served-model-name", "Qwen3.5-4B", \
+    "--dtype", "auto", \
+    "--kv-cache-dtype", "fp8", \
+    "--language-model-only", \
+    "--max-model-len", "32768", \
+    "--max-num-seqs", "8", \
+    "--gpu-memory-utilization", "0.92", \
+    "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "4192", \
+    "--enable-auto-tool-choice", \
+    "--reasoning-parser", "qwen3", \
+    "--tool-call-parser", "qwen3_coder", \
+    "--default-chat-template-kwargs", "{\"enable_thinking\": false}", \
+    "--override-generation-config", "{\"temperature\": 0.7, \"top_p\": 0.8, \"top_k\": 20}", \
+    "--trust-remote-code" \
+]

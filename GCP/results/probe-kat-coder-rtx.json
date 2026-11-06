@@ -1,0 +1,42 @@
+{
+  "base_url": "https://kat-coder-v2-5-dev-590618446755.asia-southeast1.run.app",
+  "model": "KAT-Coder-V2.5-Dev",
+  "models": [
+    "KAT-Coder-V2.5-Dev"
+  ],
+  "tool_call": {
+    "seconds": 0.4,
+    "tool_calls": [
+      {
+        "name": "read_file",
+        "arguments": "{\"path\": \"README.md\"}"
+      }
+    ],
+    "reasoning_present": true,
+    "finish_reason": "tool_calls",
+    "usage": {
+      "prompt_tokens": 293,
+      "total_tokens": 347,
+      "completion_tokens": 54,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": {
+        "reasoning_tokens": 26
+      }
+    }
+  },
+  "single_stream": {
+    "ttft_s": 0.143,
+    "total_s": 2.26,
+    "completion_tokens": 371,
+    "decode_tok_s": 175.1,
+    "finish_reason": "stop"
+  },
+  "concurrent": {
+    "streams": 16,
+    "wall_s": 6.27,
+    "aggregate_tok_s": 1530.3,
+    "ttft_s_median": 0.151,
+    "per_stream_decode_tok_s_median": 98.3,
+    "completion_tokens_total": 9600
+  }
+}

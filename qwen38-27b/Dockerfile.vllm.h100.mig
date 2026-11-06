@@ -1,0 +1,98 @@
+# =============================================================================
+# Dockerfile.vllm.h100.mig — Serve Qwen3.8-27B-FP8 via vLLM on one H100 MIG
+# slice (3g.47gb profile). For shared-GPU deployments where several models
+# each get a MIG partition. Replaces Qwen2.5-Coder-32B-Instruct-AWQ (2024;
+# 9–38 % on SWE-bench Verified).
+#
+# Qwen3.8-27B (2026-08-05, Apache-2.0): 27B dense hybrid GDN model. Qwen's own
+# numbers (Claude Code harness): SWE-bench Pro 61.7, Terminal-Bench 2.1 73.0,
+# LiveCodeBench v6 90.3, SWE-bench Multilingual 73.8.
+# Checkpoint: official Qwen/Qwen3.8-27B-FP8 (~31 GB, block-wise FP8). H100 MIG
+# slices keep SM90 FP8 tensor cores, so FP8 weights and FP8 KV run natively.
+# served-model-name "Qwen3.8-27B" is the model id clients send in requests.
+#
+# Target slice: H100 94GB MIG profile 3g.47gb (~47 GB ≈ 44–46 GiB visible).
+#   - Weights (FP8, vision tower skipped):             ~28 GiB
+#   - Activations (4192 batched tokens) + CUDA graphs:  ~1.5 GiB
+#   - Budget at 0.95 utilization:                       ~42 GiB
+#   - KV/GDN cache pool:                                ~12 GiB  (~115K tokens
+#     at the ~105 KB/token this architecture reports with FP8 KV)
+#   → --max-model-len 32768: ~3 full-context sequences resident, more at
+#     shorter prompts. 65536 also starts (one full-context sequence) if you
+#     need longer agent sessions more than concurrency.
+#
+# vLLM runtime: v0.32.0 (Qwen3.8 requires transformers >= 5.8.0).
+#
+# Build (downloads ~31 GB of weights into the image; allow time and disk):
+#   docker build -f Dockerfile.vllm.h100.mig -t qwen38-27b-vllm:mig3g .
+# Optional HF token (avoids download rate limits): --build-arg HF_TOKEN=hf_xxx
+# Run on a MIG device (find the UUID with `nvidia-smi -L`):
+#   docker run --gpus '"device=MIG-<uuid>"' --ipc=host -p 8000:8000 \
+#       -e VLLM_API_KEY=change-me qwen38-27b-vllm:mig3g
+# First start takes 5–20 min; /health returns 200 only when ready (see README.md).
+# =============================================================================
+
+FROM python:3.12.11-slim AS model-download
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv pip install --system "huggingface_hub"
+RUN hf download Qwen/Qwen3.8-27B-FP8 \
+        --local-dir /model/qwen38-27b
+
+FROM vllm/vllm-openai:v0.32.0
+LABEL org.opencontainers.image.title="Qwen3.8-27B-FP8 vLLM Server (H100 MIG 3g.47gb)" \
+      org.opencontainers.image.description="Qwen3.8-27B-FP8 served via vLLM on one H100 3g.47gb MIG slice"
+
+ENV MODEL_PATH=/model/qwen38-27b
+# Per-layer shards copied in ~4 GB groups instead of one 31 GB layer: a
+# transient failure during the registry push only retries one small layer.
+COPY --from=model-download /model/qwen38-27b/layers-[0-9].safetensors  /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-1[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-2[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-3[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-4[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-5[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-6[0-3].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/outside.safetensors         /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/mtp.safetensors             /model/qwen38-27b/
+# Config, tokenizer, index, chat template and checksum files (small).
+COPY --from=model-download /model/qwen38-27b/*.json  /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/*.txt   /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/*.jinja /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/LICENSE /model/qwen38-27b/
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=8 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+# --language-model-only  : skip the vision encoder (weights + multimodal
+#                          profiling budget) — this slice needs every GiB.
+# --kv-cache-dtype fp8   : native FP8 KV on H100, halves attention cache.
+# --mamba-cache-mode align + --enable-chunked-prefill + --max-num-batched-tokens
+#                          4192 (>= hybrid Mamba block size): required combo
+#                          for prefix caching on hybrid GDN models.
+# --reasoning-parser qwen3 / --tool-call-parser qwen3_coder: thinking mode is
+#                          on by default; tool calling is required by coding
+#                          agents (e.g. Copilot BYOK CLI + agent).
+# Set VLLM_API_KEY in the container environment to require a bearer token.
+CMD [ \
+    "/model/qwen38-27b", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--served-model-name", "Qwen3.8-27B", \
+    "--dtype", "auto", \
+    "--kv-cache-dtype", "fp8", \
+    "--language-model-only", \
+    "--max-model-len", "32768", \
+    "--max-num-seqs", "4", \
+    "--gpu-memory-utilization", "0.95", \
+    "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "4192", \
+    "--enable-auto-tool-choice", \
+    "--reasoning-parser", "qwen3", \
+    "--tool-call-parser", "qwen3_coder", \
+    "--trust-remote-code" \
+]

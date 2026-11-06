@@ -1,0 +1,18 @@
+# Cloud Build config for qwen35-4b/Dockerfile.vllm.h100.mig -> Artifact Registry (asia-southeast1)
+# Machine type / disk per Cloud Run GPU best practices (model baked into image).
+# timeout 7200s: the weights are downloaded inside the build.
+steps:
+- name: gcr.io/cloud-builders/docker
+  args: ['build', '-f', 'Dockerfile.vllm.h100.mig', '-t', '${_IMAGE}', '.']
+- name: gcr.io/cloud-builders/docker
+  args: ['push', '${_IMAGE}']
+images:
+- '${_IMAGE}'
+substitutions:
+  _IMAGE: asia-southeast1-docker.pkg.dev/${PROJECT_ID}/vllm/qwen35-4b-vllm:mig2g
+options:
+  dynamicSubstitutions: true
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: '500'
+  logging: CLOUD_LOGGING_ONLY
+timeout: 7200s

@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy-aca.sh — Deploy Qwen3.6-35B-A3B on Azure Container Apps Serverless GPU
+# deploy-aca.sh — Deploy Qwen3.8-27B-FP8 on Azure Container Apps Serverless GPU
+#
+# NOTE ON GPU CHOICE (H100 vs A100):
+#   Azure Container Apps Serverless GPU does NOT offer an H100 workload profile
+#   in any region — the only Consumption GPU profiles available are:
+#     - Consumption-GPU-NC8as-T4  (16 GB, too small for a 27B model)
+#     - Consumption-GPU-NC24-A100 (80 GB)
+#   Qwen3.8-27B-FP8 (~31 GB weights) therefore runs on A100, which is the
+#   target the Dockerfile is optimized for. If true H100 is required, it must
+#   be hosted on AKS (NC H100 v5) rather than ACA — see
+#   ../../../qwen38-27b/Dockerfile.vllm.h100 and ../../README.md (AKS section).
 #
 # Prerequisites:
 #   - Azure CLI logged in (az login)
 #   - GPU quota approved for Consumption-GPU-NC24-A100
-#   - Image pushed to ACR: crjay.azurecr.io/qwen36-35b-a3b-vllm:latest
+#   - Image already pushed to ACR: crjay.azurecr.io/qwen38-27b-vllm:latest
+#     Build it with ACR Tasks from the repo root Dockerfile:
+#       ../../build-acr.sh qwen38-27b/Dockerfile.vllm.a100
+#     (equivalent to: az acr build --registry crjay --image qwen38-27b-vllm:latest
+#      --file Dockerfile.vllm.a100 --timeout 7200 .   run inside ../../../qwen38-27b)
 #
 # Usage:
 #   chmod +x deploy-aca.sh && ./deploy-aca.sh
@@ -15,12 +29,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration — adjust these as needed
 # ---------------------------------------------------------------------------
-RESOURCE_GROUP="rg-qwen36-35b-a3b"
+RESOURCE_GROUP="rg-qwen38-27b"
 LOCATION="eastus"
-ENVIRONMENT_NAME="aca-env-qwen36-35b-a3b"
-CONTAINER_APP_NAME="qwen36-35b-a3b"
+ENVIRONMENT_NAME="aca-env-qwen38-27b"
+CONTAINER_APP_NAME="qwen38-27b"
 ACR_NAME="crjay"
-IMAGE="${ACR_NAME}.azurecr.io/qwen36-35b-a3b-vllm:latest"
+IMAGE="${ACR_NAME}.azurecr.io/qwen38-27b-vllm:latest"
 WORKLOAD_PROFILE_NAME="gpu-a100"
 WORKLOAD_PROFILE_TYPE="Consumption-GPU-NC24-A100"
 
@@ -44,10 +58,10 @@ az containerapp env workload-profile add \
     --workload-profile-name "$WORKLOAD_PROFILE_NAME" \
     --workload-profile-type "$WORKLOAD_PROFILE_TYPE"
 
-echo "=== Enabling Artifact Streaming on ACR ==="
+echo "=== Enabling Artifact Streaming on ACR (faster pull of the ~30GB image) ==="
 az acr artifact-streaming create \
     --registry "$ACR_NAME" \
-    --image "qwen36-35b-a3b-vllm:latest" 2>/dev/null || \
+    --image "qwen38-27b-vllm:latest" 2>/dev/null || \
     echo "  (Artifact streaming may already be enabled or not supported on this SKU)"
 
 echo "=== Creating Container App ==="
@@ -66,8 +80,9 @@ az containerapp create \
     --workload-profile-name "$WORKLOAD_PROFILE_NAME" \
     --output none
 
-echo "=== Updating Container App with Startup Probe (YAML) ==="
-# Export current config, merge probe settings, and update
+echo "=== Applying Startup/Liveness/Readiness Probes (YAML) ==="
+# vLLM needs a generous startup budget (~21 min) to load FP8 weights and run
+# torch.compile for the hybrid GDN backend before /health returns 200.
 az containerapp update \
     --name "$CONTAINER_APP_NAME" \
     --resource-group "$RESOURCE_GROUP" \
@@ -86,5 +101,10 @@ echo "Application URL: https://${FQDN}"
 echo "Health check:    https://${FQDN}/health"
 echo "OpenAI API:      https://${FQDN}/v1/chat/completions"
 echo ""
-echo "Test with:"
+echo "The container takes ~10-20 min to fully start (FP8 load + torch.compile)."
+echo "Verify readiness with:"
 echo "  curl https://${FQDN}/v1/models"
+echo ""
+echo "Use as Copilot CLI BYOK endpoint:"
+echo "  export COPILOT_LLM_BASE_URL=\"https://${FQDN}/v1\""
+echo "  export COPILOT_LLM_MODEL=\"Qwen3.8-27B\""

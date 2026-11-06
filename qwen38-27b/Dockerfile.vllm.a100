@@ -1,0 +1,192 @@
+# =============================================================================
+# Dockerfile.vllm.a100 — Serve Qwen3.8-27B-FP8 via vLLM on 1× NVIDIA A100 80GB
+#
+# Qwen3.8-27B (released 2026-08-05, Apache-2.0) is the direct successor of the
+# Qwen3.6-27B this image used to serve. It is the SAME architecture (27B dense,
+# 64 layers, hybrid Gated DeltaNet + Gated Attention, 262K native context) —
+# config.json is identical apart from the transformers version — so every
+# memory/serving decision below carries over unchanged. What changed is the
+# model quality (Qwen's own numbers, Claude Code harness, 256K ctx):
+#
+#   Benchmark                    Qwen3.8-27B   Qwen3.6-27B
+#   SWE-bench Pro                    61.7          53.5
+#   Terminal-Bench 2.1 (Terminus)    73.0          63.4
+#   DeepSWE 1.1                      42.2          13.3
+#   NL2Repo-Bench                    42.3          36.2
+#   LiveCodeBench v6                 90.3          83.9
+#   SWE-bench Multilingual           73.8          71.3
+#
+# Checkpoint: official Qwen/Qwen3.8-27B-FP8 (block-wise FP8 E4M3, block 128,
+# ~31 GB: 24.7B FP8 params + 3.1B BF16 for embeddings / lm_head / norms /
+# GDN gate projections / vision tower).
+#
+# Why FP8 weights (Qwen/Qwen3.8-27B-FP8)?
+#   BF16 weights (~56 GB) leave only ~21 GB for KV-cache at 0.95 utilization.
+#   FP8 weights (~31 GB) free ~25 GB more. On A100 (SM80, no FP8 tensor cores)
+#   vLLM uses Marlin W8A16 kernels — weights are dequantized during GEMM, so the
+#   benefit is memory capacity + bandwidth, not FP8 compute (needs H100/SM89+).
+#   Quality: Qwen reports "nearly identical" performance to BF16.
+#
+# Architecture: 27B dense, 64 layers
+#   Layout: 16 × (3 × (Gated DeltaNet → FFN) → 1 × (Gated Attention → FFN))
+#   - 48 GDN layers: linear attention with a fixed-size recurrent state
+#   - 16 full attention layers: 24Q/4KV heads, head_dim 256 (paged KV-cache)
+#   - FFN intermediate dim: 17408; MTP head trained with multi-steps
+#   - Native vision tower (NOT loaded here, see --language-model-only)
+#
+# A100 80GB (SM80):
+#   - 80 GB HBM2e, 2 TB/s bandwidth
+#   - FP8 KV-cache via software quantization — halves cache memory
+#   - torch.compile + CUDA graphs (default O2 FULL_AND_PIECEWISE mode)
+#   - Mamba hybrid: --mamba-cache-mode align + chunked prefill
+#
+# Memory budget (approximate):
+#   - Model weights (FP8 Marlin W8A16, vision tower skipped): ~28 GiB
+#   - Activations (8384 batched tokens) + CUDA graphs:        ~2 GiB
+#   - Available at 0.95 utilization:                           76 GiB
+#   - KV/GDN cache pool:                                      ~46 GiB
+#   - vLLM's reported pool capacity for this architecture with FP8 KV is
+#     ~105 KB per token (calibrated against the official vLLM recipe numbers
+#     for Qwen3.8-27B), i.e. ~450K cached tokens: ~3 full 128K sequences,
+#     ~7 at 64K, ~13 at 32K. --max-num-seqs 8 is a scheduler cap; vLLM
+#     preempts/queues beyond what fits.
+#
+# vLLM runtime: v0.32.0 (2026-10-18). Qwen3.8's config/processor were written
+# by transformers 5.8.0 and the official vLLM recipe requires
+# transformers >= 5.8.0; v0.32.0 ships transformers 5.16–5.19. The previous
+# v0.20.1 image predates transformers 5.8.0 and cannot be used.
+#
+# Status of issues tracked by the previous (Qwen3.6) version of this file:
+#   - MTP speculative decoding on hybrid models: vLLM PR #39949 merged
+#     2026-05-13. The in-checkpoint MTP head works (recipe-measured acceptance
+#     0.77 on FP8). Still OPTIONAL here; enable only after a load test:
+#       "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3}",
+#   - mamba-cache-mode "all": REMOVED in vLLM 0.32 (fails validation). "align"
+#     is now the default whenever prefix caching is on; kept explicit below.
+#   - GPTQ/AWQ hybrid page-size bug (#41153): irrelevant for FP8 weights.
+#
+# Build (downloads ~31 GB of weights into the image; allow time and disk):
+#   docker build -f Dockerfile.vllm.a100 -t qwen38-27b-vllm:a100 .
+# Optional HF token (avoids download rate limits):
+#   docker build --build-arg HF_TOKEN=hf_xxx -f Dockerfile.vllm.a100 -t qwen38-27b-vllm:a100 .
+# Run:
+#   docker run --gpus all --ipc=host -p 8000:8000 -e VLLM_API_KEY=change-me qwen38-27b-vllm:a100
+# First start takes 5–20 min (weight load + torch.compile + CUDA graph capture);
+# /health returns 200 only when the server is ready — size startup probes
+# accordingly (see README.md).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Download official FP8 model weights (~31 GB)
+# ---------------------------------------------------------------------------
+FROM python:3.12.11-slim AS model-download
+
+# Optional: HF token avoids download rate limits in CI/CD pipelines
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN uv pip install --system "huggingface_hub"
+
+RUN hf download Qwen/Qwen3.8-27B-FP8 \
+        --local-dir /model/qwen38-27b
+
+# ---------------------------------------------------------------------------
+# Stage 2: vLLM runtime (A100)
+# ---------------------------------------------------------------------------
+FROM vllm/vllm-openai:v0.32.0
+
+LABEL org.opencontainers.image.title="Qwen3.8-27B-FP8 vLLM Server (A100 80GB)" \
+      org.opencontainers.image.description="Qwen3.8-27B-FP8 27B dense (FP8 Marlin W8A16) served via vLLM on one A100 80GB"
+
+ENV MODEL_PATH=/model/qwen38-27b
+
+# The checkpoint ships one safetensors file per decoder layer (layers-0 ..
+# layers-63, ~0.38 GB each), outside.safetensors (~6 GB: embeddings, lm_head,
+# vision tower) and mtp.safetensors (~0.5 GB). Copy them in ~4 GB groups so a
+# transient registry push failure only retries one small layer instead of a
+# monolithic 31 GB layer, and so layers upload in parallel.
+COPY --from=model-download /model/qwen38-27b/layers-[0-9].safetensors  /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-1[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-2[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-3[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-4[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-5[0-9].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/layers-6[0-3].safetensors /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/outside.safetensors         /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/mtp.safetensors             /model/qwen38-27b/
+# Config, tokenizer, index, chat template and checksum files (small).
+COPY --from=model-download /model/qwen38-27b/*.json  /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/*.txt   /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/*.jinja /model/qwen38-27b/
+COPY --from=model-download /model/qwen38-27b/LICENSE /model/qwen38-27b/
+
+EXPOSE 8000
+
+# Container health check (plain Docker / Compose). Orchestrator startup probes
+# must allow for the first-start compile time (5–20 min).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=8 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+
+# ---- vLLM serving flags (A100 + FP8 + hybrid GDN) ----
+# --gpu-memory-utilization 0.95 : Maximize 80 GB HBM2e (76 GB usable)
+# --max-model-len 131072        : 128K context for coding agents (Copilot BYOK
+#                                  system prompts alone can exceed 32K). Model
+#                                  natively supports 262K; 128K balances
+#                                  concurrency.
+# --dtype auto                   : vLLM auto-detects FP8 quantization config
+# --kv-cache-dtype fp8           : FP8 KV-cache = 2× capacity vs BF16. Software
+#                                  FP8 on A100 (stored as uint8, dequant before
+#                                  attention). ~32 KB/token for 16 attn layers.
+# --language-model-only         : Skip the vision encoder: saves ~1 GB of weights
+#                                  and several GB of multimodal profiling budget
+#                                  that would otherwise be carved out of the KV
+#                                  pool. Remove to accept image/video input.
+# --enable-prefix-caching       : Reuse KV-cache for shared system prompts/files
+# --mamba-cache-mode align      : Cache GDN (linear attention) state at block
+#                                  boundaries so prefix reuse works for Mamba
+#                                  layers (vLLM 0.32 default with prefix caching)
+# --enable-chunked-prefill      : Break long prefills into chunks for stable latency
+# --max-num-batched-tokens 8384 : Must be >= the hybrid Mamba block size; 8384
+#                                  is the value proven on the Qwen3.6 build.
+# --performance-mode interactivity : Favor low per-request latency over aggregate
+#                                  throughput — ideal for coding agent workloads.
+# --reasoning-parser qwen3      : Thinking mode is ON by default; without the
+#                                  parser the whole <think> block lands in
+#                                  message.content. Per-request control via
+#                                  chat_template_kwargs {"enable_thinking": false}
+#                                  or reasoning_effort "xhigh" | "medium" | "low".
+# --tool-call-parser qwen3_coder: Qwen3.8 native tool calling format (tool
+#                                  calling is required by coding agents such as
+#                                  Copilot BYOK)
+# --max-num-seqs 8              : Scheduler cap (see memory budget above)
+# --served-model-name           : The model id clients send in requests
+#
+# NOTE: No --quantization flag needed — vLLM auto-detects FP8 from config.json.
+# NOTE: No --enforce-eager. torch.compile + CUDA graphs are enabled by default.
+# NOTE: Set VLLM_API_KEY in the container environment to require a bearer token.
+CMD [ \
+    "/model/qwen38-27b", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--tensor-parallel-size", "1", \
+    "--trust-remote-code", \
+    "--gpu-memory-utilization", "0.95", \
+    "--max-model-len", "131072", \
+    "--dtype", "auto", \
+    "--kv-cache-dtype", "fp8", \
+    "--language-model-only", \
+    "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "8384", \
+    "--performance-mode", "interactivity", \
+    "--enable-auto-tool-choice", \
+    "--reasoning-parser", "qwen3", \
+    "--tool-call-parser", "qwen3_coder", \
+    "--max-num-seqs", "8", \
+    "--served-model-name", "Qwen3.8-27B" \
+]

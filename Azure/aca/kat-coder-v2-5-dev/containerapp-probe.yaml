@@ -1,14 +1,21 @@
 # =============================================================================
-# containerapp-probe.yaml — Startup probe config for Qwen3.6-35B-A3B on ACA GPU
+# containerapp-probe.yaml — Startup probe config for KAT-Coder-V2.5-Dev on ACA GPU
 #
 # Why custom probes?
 #   Azure Container Apps does NOT add default probes for GPU workload profiles.
 #   Without an explicit startup probe, the platform may kill the container before
-#   the model finishes loading (~5-10 min for 35B MoE with FP8 quantization).
+#   the model finishes loading (~5-15 min for the 35B-A3B MoE: ~24 GB AWQ-INT4
+#   weight load + Marlin repacking + torch.compile / CUDA graph capture for the
+#   hybrid Gated DeltaNet backend).
 #
 # Startup budget calculation:
-#   initialDelaySeconds (60) + failureThreshold (60) × periodSeconds (10) = 660s
-#   This gives the container up to ~11 minutes to start serving /health.
+#   initialDelaySeconds (60) + failureThreshold (60) × periodSeconds (20) = 1260s
+#   This gives the container up to ~21 minutes to start serving /health (same
+#   budget as the Qwen3.8-27B app; the first start on a new vLLM release
+#   compiles from a cold cache).
+#   NOTE: ACA constrains initialDelaySeconds to the range [0, 60]. To extend the
+#   startup window further, increase periodSeconds (max 240) or failureThreshold,
+#   NOT initialDelaySeconds.
 #
 # vLLM /health endpoint returns 200 only after the model is fully loaded and
 # ready to serve requests.
@@ -16,8 +23,8 @@
 properties:
   template:
     containers:
-      - name: qwen36-35b-a3b
-        image: crjay.azurecr.io/qwen36-35b-a3b-vllm:latest
+      - name: kat-coder-v2-5-dev
+        image: crjay.azurecr.io/kat-coder-v2-5-dev-vllm:latest
         resources:
           cpu: 24
           memory: 220Gi
@@ -27,8 +34,8 @@ properties:
               path: /health
               port: 8000
             initialDelaySeconds: 60
-            periodSeconds: 10
-            timeoutSeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 15
             failureThreshold: 60
           - type: Liveness
             httpGet:

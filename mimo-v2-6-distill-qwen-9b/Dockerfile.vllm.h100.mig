@@ -1,0 +1,122 @@
+# =============================================================================
+# Dockerfile.vllm.h100.mig — Serve MiMo-V2.6-Distill-Qwen-9B via vLLM on one
+# H100 MIG slice (2g.24gb profile). A mid-size agent/chat model for shared-GPU
+# deployments. Replaces Qwen2.5-Coder-7B-Instruct (2024; no meaningful
+# SWE-bench score).
+#
+# XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B (2026-09-21, MIT): Qwen3.5-9B
+# architecture (9B dense, hybrid Gated DeltaNet + Gated Attention, 262K native
+# context) SFT-distilled from MiMo-V2.6 on agentic coding / cyber / tool-use
+# trajectories. Xiaomi's numbers (MiMo-V2.6 technical report, avg@3):
+#
+#   Benchmark               Qwen3.5-9B   MiMo-V2.6-Distill-Qwen-9B
+#   SWE-bench Verified         60.0            61.1
+#   SWE-bench Pro              32.0            44.6
+#   Terminal-Bench 2.1         27.0            37.1
+#   Toolathlon-Verified        25.9            35.2
+#   AutomationBench v1.0.6      5.0            30.3
+#
+# Weights: BF16 as shipped (~18.8 GB incl. vision tower; ~18 GB loaded with
+# --language-model-only). Qwen3_5ForConditionalGeneration is natively supported
+# by vLLM; the MiMo v2.6 chat template (<think> reasoning, <tool_call>
+# <function=…><parameter=…> tool calls) is parsed by vLLM's "mimo" reasoning
+# and tool parsers — the same flags Xiaomi's own vLLM recipe uses.
+# served-model-name "MiMo-V2.6-Distill-Qwen-9B" is the model id clients send.
+#
+# Memory (H100 94GB MIG profile 2g.24gb, ~24 GB ≈ 23.5 GiB visible):
+#   - Weights (BF16, vision tower skipped):             ~17 GiB
+#   - Activations (4192 batched tokens) + CUDA graphs:   ~1 GiB
+#   - Budget at 0.92 utilization (the rest stays free for the CUDA context
+#     and graph capture, which allocate OUTSIDE the budget):  ~21.6 GiB
+#   - KV/GDN cache pool:                                 ~3.5 GiB
+#   - Per-token pool cost ≈ 32 layers × 2 MiB GDN-state page / 1048 tokens
+#     ≈ 64 KB → ~55K cached tokens: ~2 full 32K sequences resident, ~4 at 16K.
+#     (A 32K sequence needs ~2 GiB, so startup has >1.5× headroom.)
+#   - Need more concurrency on this slice? H100 MIG keeps native FP8, so
+#     "--quantization", "fp8" (online dynamic FP8) cuts weights to ~10 GiB and
+#     roughly triples the pool. Not enabled by default because it also
+#     quantizes the small GDN gate projections that Qwen's official FP8
+#     checkpoints deliberately keep in BF16 — validate quality first.
+#   - 128K context will NOT fit a 24 GB slice — use the 3g.47gb images for
+#     longer context.
+#
+# vLLM runtime: v0.32.0 (config written by transformers 5.12; 0.32 ships
+# 5.16–5.19 and the "mimo" parsers).
+#
+# Build (downloads ~19 GB of weights into the image; allow time and disk):
+#   docker build -f Dockerfile.vllm.h100.mig -t mimo-v2-6-distill-qwen-9b-vllm:mig2g .
+# Optional HF token (avoids download rate limits): --build-arg HF_TOKEN=hf_xxx
+# Run on a MIG device (find the UUID with `nvidia-smi -L`):
+#   docker run --gpus '"device=MIG-<uuid>"' --ipc=host -p 8000:8000 \
+#       -e VLLM_API_KEY=change-me mimo-v2-6-distill-qwen-9b-vllm:mig2g
+# First start takes 3–10 min; /health returns 200 only when ready (see README.md).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: bake the model weights (~18.8 GB, 4 shards)
+# ---------------------------------------------------------------------------
+FROM python:3.12.11-slim AS model-download
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv pip install --system "huggingface_hub"
+RUN hf download XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B \
+        --local-dir /model/mimo-v2-6-distill-qwen-9b
+
+# ---------------------------------------------------------------------------
+# Stage 2: vLLM runtime
+# ---------------------------------------------------------------------------
+FROM vllm/vllm-openai:v0.32.0
+LABEL org.opencontainers.image.title="MiMo-V2.6-Distill-Qwen-9B vLLM Server (H100 MIG 2g.24gb)" \
+      org.opencontainers.image.description="MiMo-V2.6-Distill-Qwen-9B (Qwen3.5-9B arch, agentic-coding distill) served via vLLM on one H100 2g.24gb MIG slice"
+
+ENV MODEL_PATH=/model/mimo-v2-6-distill-qwen-9b
+# One image layer per shard so a registry push retry only re-uploads ~5 GB.
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/model-00001-of-00004.safetensors /model/mimo-v2-6-distill-qwen-9b/
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/model-00002-of-00004.safetensors /model/mimo-v2-6-distill-qwen-9b/
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/model-00003-of-00004.safetensors /model/mimo-v2-6-distill-qwen-9b/
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/model-00004-of-00004.safetensors /model/mimo-v2-6-distill-qwen-9b/
+# Config, tokenizer, index, chat template files (small).
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/*.json  /model/mimo-v2-6-distill-qwen-9b/
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/*.txt   /model/mimo-v2-6-distill-qwen-9b/
+COPY --from=model-download /model/mimo-v2-6-distill-qwen-9b/*.jinja /model/mimo-v2-6-distill-qwen-9b/
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=6 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+# --language-model-only  : skip the vision encoder (weights + multimodal
+#                          profiling budget) — this slice needs every GiB.
+# --kv-cache-dtype fp8   : native FP8 KV on H100, halves attention cache.
+# --mamba-cache-mode align + --enable-chunked-prefill + --max-num-batched-tokens
+#                          4192 (>= hybrid Mamba block size): required combo for
+#                          prefix caching on hybrid GDN models; prefix caching
+#                          reuses KV for shared system prompts / repo context.
+# --reasoning-parser mimo / --tool-call-parser mimo: MiMo v2.6 chat template.
+#                          Thinking is on by default (per-request off via
+#                          chat_template_kwargs {"enable_thinking": false}).
+#                          Tool calling is required by coding agents (e.g.
+#                          Copilot BYOK CLI + agent).
+# Sampling defaults come from the model's generation_config.json
+# (temperature 0.6, top_p 0.95, top_k 20).
+# Set VLLM_API_KEY in the container environment to require a bearer token.
+CMD [ \
+    "/model/mimo-v2-6-distill-qwen-9b", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--served-model-name", "MiMo-V2.6-Distill-Qwen-9B", \
+    "--dtype", "auto", \
+    "--kv-cache-dtype", "fp8", \
+    "--language-model-only", \
+    "--max-model-len", "32768", \
+    "--max-num-seqs", "4", \
+    "--gpu-memory-utilization", "0.92", \
+    "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "4192", \
+    "--enable-auto-tool-choice", \
+    "--reasoning-parser", "mimo", \
+    "--tool-call-parser", "mimo", \
+    "--trust-remote-code" \
+]

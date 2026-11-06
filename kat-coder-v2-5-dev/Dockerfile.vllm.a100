@@ -1,0 +1,162 @@
+# =============================================================================
+# Dockerfile.vllm.a100 — Serve KAT-Coder-V2.5-Dev (AWQ INT4) via vLLM on
+# 1× NVIDIA A100 80GB
+#
+# KAT-Coder-V2.5-Dev (Kuaishou Kwaipilot, 2026-07-23, Apache-2.0) is the
+# open-weight release of KAT-Coder-V2.5: a 35B-total / 3B-active MoE that is a
+# SWE-specialised SFT+RL post-train of Qwen3.6-35B-A3B — the exact model this
+# image used to serve. Same architecture (Qwen3_5MoeForConditionalGeneration,
+# 40 layers, hybrid Gated DeltaNet + Gated Attention, 256 experts / 8+1 active,
+# 262K native context), so every serving decision below carries over.
+# Kwaipilot's numbers, SAME harness for both models (Claude Code 2.1.195,
+# pass@1, temp 1.0, 256K ctx):
+#
+#   Benchmark                 KAT-Coder-V2.5-Dev   Qwen3.6-35B-A3B
+#   SWE-bench Verified              69.40              64.40
+#   SWE-bench Multilingual          63.00              57.00
+#   SWE-bench Pro                   45.96              40.63
+#   Terminal-Bench 2.1              41.02              32.02
+#   KAT-Code-Bench                  46.21              44.83
+#   (RL also cut malformed tool-call labels from 9.34 % to 0.28 %.)
+#
+# Pre-quantized checkpoint: cyankiwi/KAT-Coder-V2.5-Dev-AWQ-INT4 (~24.4 GB)
+#   - compressed-tensors format, W4A16, asymmetric, group_size 32, MSE observer
+#   - ONLY the routed MoE expert weights are INT4; attention, Gated DeltaNet,
+#     router gates, shared experts, embeddings and lm_head stay 16-bit — the
+#     same "experts-only" strategy as the GPTQ-Int4 build it replaces
+#   - checkpoint dtype float16 (hence --dtype float16 below)
+#   - same quantizer whose AWQ build served Kimi-Dev-72B in this repo
+#
+# Why not FP8 / BF16?
+#   BF16 is 69 GB — no KV headroom on one 80 GB GPU. There is no official FP8
+#   build, and A100 (SM80) has no FP8 tensor cores anyway. W4A16 experts via
+#   the Marlin / WNA16 MoE kernels is the path the previous GPTQ build of this
+#   architecture already proved on A100.
+#
+# Checkpoint peculiarities (from the KAT model card):
+#   - Ships language-model weights ONLY: no vision tower, no MTP head
+#     (config still declares vision_config → --language-model-only REQUIRED,
+#     otherwise vLLM tries to build the vision encoder and fails on missing
+#     weights). MTP speculative decoding is therefore not available.
+#   - Thinking mode is on by default; supports chat_template_kwargs
+#     {"enable_thinking": false} and {"preserve_thinking": true}.
+#
+# Important: Mamba hybrid architecture constraint
+#   Hybrid GDN block_size is 2096 tokens with FP8 KV. With chunked prefill +
+#   align-mode prefix caching, --max-num-batched-tokens MUST be >= 2096
+#   (8384 = 4 × 2096 is the value proven on the Qwen3.6-35B-A3B build).
+#
+# Memory budget (approximate):
+#   - Model weights (INT4 experts + 16-bit rest):   ~23 GiB
+#   - Activations (8384 batched tokens) + graphs:    ~2 GiB
+#   - Available at 0.95 utilization:                  76 GiB
+#   - KV/GDN cache pool:                             ~51 GiB
+#   - Per-token pool cost ≈ 40 layers × 2 MiB GDN-state page / 2096 tokens
+#     ≈ 40–45 KB → ~1.2M cached tokens → ~9 full 128K sequences.
+#
+# vLLM runtime: v0.32.0 (2026-10-18). Hybrid + Marlin/WNA16 KV page-size
+# unification (#41153) was fixed on main by PR #37467 (2026-03-30) and is in
+# this release; asymmetric INT4 group-32 MoE is handled by
+# CompressedTensorsWNA16MoEMethod (zero-points supported, group 32 special-
+# cased). mamba-cache-mode "all" was removed in 0.32; "align" is the default.
+#
+# Build (downloads ~24 GB of weights into the image; allow time and disk):
+#   docker build -f Dockerfile.vllm.a100 -t kat-coder-v2-5-dev-vllm:a100 .
+# Optional HF token (avoids download rate limits): --build-arg HF_TOKEN=hf_xxx
+# Run:
+#   docker run --gpus all --ipc=host -p 8000:8000 -e VLLM_API_KEY=change-me \
+#       kat-coder-v2-5-dev-vllm:a100
+# First start takes 5–15 min (weight load + Marlin repack + torch.compile);
+# /health returns 200 only when the server is ready (see README.md).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Download pre-quantized AWQ-INT4 model weights (~24.4 GB, 5 shards)
+# ---------------------------------------------------------------------------
+FROM python:3.12.11-slim AS model-download
+
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN uv pip install --system "huggingface_hub"
+
+RUN hf download cyankiwi/KAT-Coder-V2.5-Dev-AWQ-INT4 \
+        --local-dir /model/kat-coder-v2-5-dev
+
+# ---------------------------------------------------------------------------
+# Stage 2: vLLM runtime (A100)
+# ---------------------------------------------------------------------------
+FROM vllm/vllm-openai:v0.32.0
+
+LABEL org.opencontainers.image.title="KAT-Coder-V2.5-Dev AWQ-INT4 vLLM Server (A100 80GB)" \
+      org.opencontainers.image.description="KAT-Coder-V2.5-Dev MoE (35B total, 3B active; Qwen3.6-35B-A3B SWE post-train) AWQ INT4 served via vLLM on one A100 80GB"
+
+ENV MODEL_PATH=/model/kat-coder-v2-5-dev
+
+# One image layer per ~5.4 GB shard: a transient registry push failure only
+# retries one shard instead of a monolithic 24 GB layer.
+COPY --from=model-download /model/kat-coder-v2-5-dev/model-00001-of-00005.safetensors /model/kat-coder-v2-5-dev/
+COPY --from=model-download /model/kat-coder-v2-5-dev/model-00002-of-00005.safetensors /model/kat-coder-v2-5-dev/
+COPY --from=model-download /model/kat-coder-v2-5-dev/model-00003-of-00005.safetensors /model/kat-coder-v2-5-dev/
+COPY --from=model-download /model/kat-coder-v2-5-dev/model-00004-of-00005.safetensors /model/kat-coder-v2-5-dev/
+COPY --from=model-download /model/kat-coder-v2-5-dev/model-00005-of-00005.safetensors /model/kat-coder-v2-5-dev/
+# Config, tokenizer, index, chat template files (small).
+COPY --from=model-download /model/kat-coder-v2-5-dev/*.json  /model/kat-coder-v2-5-dev/
+COPY --from=model-download /model/kat-coder-v2-5-dev/*.txt   /model/kat-coder-v2-5-dev/
+COPY --from=model-download /model/kat-coder-v2-5-dev/*.jinja /model/kat-coder-v2-5-dev/
+
+EXPOSE 8000
+
+# Container health check (plain Docker / Compose). Orchestrator startup probes
+# must allow for the first-start compile time (5–15 min).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=8 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+
+# ---- vLLM serving flags (A100 + AWQ-INT4 experts + hybrid GDN) ----
+# --quantization compressed-tensors : Matches quantization_config.quant_method;
+#                                  vLLM picks the WNA16 MoE (Marlin) kernels.
+# --dtype float16                : Checkpoint dtype; Marlin W4A16 input dtype.
+# --language-model-only          : REQUIRED — the checkpoint has no vision weights.
+# --gpu-memory-utilization 0.95  : Maximize 80 GB HBM2e (76 GB usable)
+# --max-model-len 131072         : 128K context for coding agents (native 262K)
+# --kv-cache-dtype fp8           : FP8 KV-cache (software FP8 on A100), 2× capacity
+# --enable-prefix-caching        : Reuse KV for shared system prompts / repo context
+# --mamba-cache-mode align       : Cache GDN state at block boundaries so prefix
+#                                  reuse covers the Mamba layers (0.32 default)
+# --enable-chunked-prefill       : Break long prefills into chunks
+# --max-num-batched-tokens 8384  : 4 × Mamba block_size (2096). Must be >= 2096.
+# --reasoning-parser qwen3       : KAT thinks by default (Qwen3 <think> format)
+# --tool-call-parser qwen3_coder : Tool-calling format per the KAT model card
+# --max-num-seqs 8               : Scheduler cap (see memory budget above)
+# --served-model-name            : The model id clients send in requests
+#
+# NOTE: No --enforce-eager. torch.compile + CUDA graphs are enabled by default;
+# the GDN attention backend supports UNIFORM_BATCH capture mode. If you hit
+# instability, add --enforce-eager back.
+# NOTE: Set VLLM_API_KEY in the container environment to require a bearer token.
+CMD [ \
+    "/model/kat-coder-v2-5-dev", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
+    "--tensor-parallel-size", "1", \
+    "--trust-remote-code", \
+    "--quantization", "compressed-tensors", \
+    "--dtype", "float16", \
+    "--language-model-only", \
+    "--gpu-memory-utilization", "0.95", \
+    "--max-model-len", "131072", \
+    "--kv-cache-dtype", "fp8", \
+    "--enable-prefix-caching", \
+    "--mamba-cache-mode", "align", \
+    "--enable-chunked-prefill", \
+    "--max-num-batched-tokens", "8384", \
+    "--enable-auto-tool-choice", \
+    "--reasoning-parser", "qwen3", \
+    "--tool-call-parser", "qwen3_coder", \
+    "--max-num-seqs", "8", \
+    "--served-model-name", "KAT-Coder-V2.5-Dev" \
+]
